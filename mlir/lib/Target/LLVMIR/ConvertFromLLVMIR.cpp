@@ -1042,6 +1042,23 @@ void Importer::processFunctionAttributes(llvm::Function *func,
   };
   if (func->doesNotAccessMemory())
     addNamedUnitAttr(LLVMDialect::getReadnoneAttrName());
+  if (func->hasFnAttribute(llvm::Attribute::AlwaysInline))
+    addNamedUnitAttr(LLVMDialect::getAlwaysInlineAttrName());
+  if (func->hasFnAttribute(llvm::Attribute::NoInline))
+    addNamedUnitAttr(LLVMDialect::getNoInlineAttrName());
+
+  // Adding target-dependent attributes
+  for (auto attrs : func->getAttributes()) {
+    for (auto attr : attrs) {
+      // Target-dependent attributes are strings
+      if (!attr.isStringAttribute())
+        continue;
+
+      auto name = std::string("llvm.string.") + attr.getKindAsString().str();
+      auto value = attr.getValueAsString().str();
+      funcOp->setAttr(name, StringAttr::get(context, value));
+    }
+  }
 }
 
 LogicalResult Importer::processFunction(llvm::Function *func) {

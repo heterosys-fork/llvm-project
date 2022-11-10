@@ -52,6 +52,9 @@ def LLVM_Dialect : Dialect {
     static StringRef getSExtAttrName() { return "llvm.signext"; }
     static StringRef getZExtAttrName() { return "llvm.zeroext"; }
 
+    static StringRef getAlwaysInlineAttrName() { return "llvm.alwaysinline"; }
+    static StringRef getNoInlineAttrName() { return "llvm.noinline"; }
+
     /// Verifies if the attribute is a well-formed value for "llvm.struct_attrs"
     static LogicalResult verifyStructAttr(
         Operation *op, Attribute attr, Type annotatedType);

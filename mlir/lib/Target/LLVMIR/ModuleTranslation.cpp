@@ -1006,6 +1006,28 @@ LogicalResult ModuleTranslation::convertFunctionSignatures() {
       ++argIdx;
     }
 
+    if (function->getAttrOfType<UnitAttr>(
+            LLVMDialect::getAlwaysInlineAttrName()))
+      llvmFunc->addFnAttr(llvm::Attribute::AlwaysInline);
+    if (function->getAttrOfType<UnitAttr>(LLVMDialect::getNoInlineAttrName()))
+      llvmFunc->addFnAttr(llvm::Attribute::NoInline);
+
+    for (auto attr : function->getAttrs()) {
+      // Value must be a string
+      auto valueref = attr.getValue().dyn_cast_or_null<StringAttr>();
+      if (valueref == nullptr)
+        continue;
+
+      auto name = attr.getName().str();
+      auto value = valueref.getValue().str();
+
+      std::string prefix = "llvm.string.";
+
+      if (name.rfind(prefix, 0) == 0) {
+        llvmFunc->addFnAttr(name.substr(prefix.length()), value);
+      }
+    }
+
     // Forward the pass-through attributes to LLVM.
     if (failed(forwardPassthroughAttributes(
             function.getLoc(), function.getPassthrough(), llvmFunc)))
