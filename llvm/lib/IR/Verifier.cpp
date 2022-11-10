@@ -4932,17 +4932,8 @@ void Verifier::visitIntrinsicCall(Intrinsic::ID ID, CallBase &Call) {
   // All descriptors should be absorbed by now.
   Check(TableRef.empty(), "Intrinsic has too few arguments!", IF);
 
-  // Now that we have the intrinsic ID and the actual argument types (and we
-  // know they are legal for the intrinsic!) get the intrinsic name through the
-  // usual means.  This allows us to verify the mangling of argument types into
-  // the name.
-  const std::string ExpectedName =
-      Intrinsic::getName(ID, ArgTys, IF->getParent(), IFTy);
-  Check(ExpectedName == IF->getName(),
-        "Intrinsic name not mangled correctly for type arguments! "
-        "Should be: " +
-            ExpectedName,
-        IF);
+  // We ignore the intrinsic name check since Vitis has a different
+  // mangling approach.
 
   // If the intrinsic takes MDNode arguments, verify that they are either global
   // or are local to *this* function.
