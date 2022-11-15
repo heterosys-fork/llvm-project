@@ -12,10 +12,13 @@
 
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Target/LLVMIR/ModuleTranslation.h"
 
+#include "llvm/ADT/StringRef.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/MDBuilder.h"
@@ -205,9 +208,30 @@ static llvm::MDNode *getLoopOptionMetadata(llvm::LLVMContext &ctx,
 static void setLoopMetadata(Operation &opInst, llvm::Instruction &llvmInst,
                             llvm::IRBuilderBase &builder,
                             LLVM::ModuleTranslation &moduleTranslation) {
-  if (Attribute attr = opInst.getAttr(LLVMDialect::getLoopAttrName())) {
+
+  Attribute attr = opInst.getAttr(LLVMDialect::getLoopAttrName());
+  
+  // If Xilinx extensions exist, the loop metadata is set as well.
+  Attribute altAttr = opInst.getAttr("llvm.loop.name");
+  if (!altAttr) altAttr = opInst.getAttr("llvm.loop.vectorize.width");
+  if (!altAttr) altAttr = opInst.getAttr("llvm.loop.interleave.count");
+  if (!altAttr) altAttr = opInst.getAttr("llvm.loop.unroll.count");
+  if (!altAttr) altAttr = opInst.getAttr("llvm.loop.unroll.withoutcheck");
+  if (!altAttr) altAttr = opInst.getAttr("llvm.loop.vectorize.enable");
+  if (!altAttr) altAttr = opInst.getAttr("llvm.loop.distribute.enable");
+  if (!altAttr) altAttr = opInst.getAttr("llvm.loop.flatten.enable");
+  if (!altAttr) altAttr = opInst.getAttr("llvm.loop.dataflow.enable");
+  if (!altAttr) altAttr = opInst.getAttr("llvm.loop.pipeline.enable");
+  if (!altAttr) altAttr = opInst.getAttr("llvm.loop.latency");
+  if (!altAttr) altAttr = opInst.getAttr("llvm.loop.tripcount");
+
+  if (attr || altAttr) {
     llvm::Module *module = builder.GetInsertBlock()->getModule();
-    llvm::MDNode *loopMD = moduleTranslation.lookupLoopOptionsMetadata(attr);
+    llvm::MDNode *loopMD = nullptr;
+
+    if (attr) loopMD = moduleTranslation.lookupLoopOptionsMetadata(attr);
+    if (altAttr) loopMD = moduleTranslation.lookupLoopOptionsMetadata(altAttr);
+
     if (!loopMD) {
       llvm::LLVMContext &ctx = module->getContext();
 
@@ -216,26 +240,114 @@ static void setLoopMetadata(Operation &opInst, llvm::Instruction &llvmInst,
       auto dummy = llvm::MDNode::getTemporary(ctx, llvm::None);
       loopOptions.push_back(dummy.get());
 
-      auto loopAttr = attr.cast<DictionaryAttr>();
-      auto parallelAccessGroup =
-          loopAttr.getNamed(LLVMDialect::getParallelAccessAttrName());
-      if (parallelAccessGroup) {
-        SmallVector<llvm::Metadata *> parallelAccess;
-        parallelAccess.push_back(
-            llvm::MDString::get(ctx, "llvm.loop.parallel_accesses"));
-        for (SymbolRefAttr accessGroupRef : parallelAccessGroup->getValue()
-                                                .cast<ArrayAttr>()
-                                                .getAsRange<SymbolRefAttr>())
+      if (attr) {
+        auto loopAttr = attr.cast<DictionaryAttr>();
+        auto parallelAccessGroup =
+            loopAttr.getNamed(LLVMDialect::getParallelAccessAttrName());
+        if (parallelAccessGroup) {
+          SmallVector<llvm::Metadata *> parallelAccess;
           parallelAccess.push_back(
-              moduleTranslation.getAccessGroup(opInst, accessGroupRef));
-        loopOptions.push_back(llvm::MDNode::get(ctx, parallelAccess));
+              llvm::MDString::get(ctx, "llvm.loop.parallel_accesses"));
+          for (SymbolRefAttr accessGroupRef : parallelAccessGroup->getValue()
+                                                  .cast<ArrayAttr>()
+                                                  .getAsRange<SymbolRefAttr>())
+            parallelAccess.push_back(
+                moduleTranslation.getAccessGroup(opInst, accessGroupRef));
+          loopOptions.push_back(llvm::MDNode::get(ctx, parallelAccess));
+        }
+
+        if (auto loopOptionsAttr = loopAttr.getAs<LoopOptionsAttr>(
+                LLVMDialect::getLoopOptionsAttrName())) {
+          for (auto option : loopOptionsAttr.getOptions())
+            loopOptions.push_back(
+                getLoopOptionMetadata(ctx, option.first, option.second));
+        }
       }
 
-      if (auto loopOptionsAttr = loopAttr.getAs<LoopOptionsAttr>(
-              LLVMDialect::getLoopOptionsAttrName())) {
-        for (auto option : loopOptionsAttr.getOptions())
+      // Set Xilinx extensions
+      // The folllowing are adapted from clang/lib/CodeGen/CGLoopInfo.cpp
+      // of Xilinx/hls-llvm-project and may be copyrighted by Xilinx.
+      // The original code was licensed with Apache.
+      if (Attribute attr = opInst.getAttr("llvm.loop.name")) {
+        auto loopAttr = attr.cast<StringAttr>();
+        loopOptions.push_back(
+            llvm::MDNode::get(ctx, {llvm::MDString::get(ctx, "llvm.loop.name"),
+                                    llvm::MDString::get(ctx, loopAttr.str())}));
+      }
+
+      auto createIntAttr = [&](llvm::Type *type, llvm::StringRef name) {
+        if (Attribute attr = opInst.getAttr(name)) {
+          auto loopAttr = attr.cast<IntegerAttr>();
+          loopOptions.push_back(llvm::MDNode::get(
+              ctx, {llvm::MDString::get(ctx, name),
+                    llvm::ConstantAsMetadata::get(
+                        llvm::ConstantInt::get(type, loopAttr.getInt()))}));
+        }
+      };
+
+      auto *i32Type = llvm::Type::getInt32Ty(ctx);
+      createIntAttr(i32Type, "llvm.loop.vectorize.width");
+      createIntAttr(i32Type, "llvm.loop.interleave.count");
+      createIntAttr(i32Type, "llvm.loop.unroll.count");
+      createIntAttr(i32Type, "llvm.loop.unroll.withoutcheck");
+
+      auto *i1Type = llvm::Type::getInt1Ty(ctx);
+      createIntAttr(i1Type, "llvm.loop.vectorize.enable");
+      createIntAttr(i1Type, "llvm.loop.distribute.enable");
+      createIntAttr(i1Type, "llvm.loop.flatten.enable");
+      createIntAttr(i1Type, "llvm.loop.dataflow.enable");
+
+      auto createUnitAttr = [&](llvm::StringRef name) {
+        if (Attribute attr = opInst.getAttr(name)) {
           loopOptions.push_back(
-              getLoopOptionMetadata(ctx, option.first, option.second));
+              llvm::MDNode::get(ctx, {llvm::MDString::get(ctx, name)}));
+        }
+      };
+      createUnitAttr("llvm.loop.unroll.enable");
+      createUnitAttr("llvm.loop.unroll.full");
+      createUnitAttr("llvm.loop.unroll.disable");
+
+      // Special attributes with multiple operands
+      if (Attribute attr = opInst.getAttr("llvm.loop.pipeline.enable")) {
+        auto loopAttr = attr.cast<ArrayAttr>();
+        auto pipelineII = loopAttr.getValue()[0].cast<IntegerAttr>();
+        auto rewind = loopAttr.getValue()[1].cast<IntegerAttr>();
+        auto pipelineStyle = loopAttr.getValue()[2].cast<IntegerAttr>();
+        loopOptions.push_back(llvm::MDNode::get(
+            ctx, {llvm::MDString::get(ctx, "llvm.loop.pipeline.enable"),
+                  llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                      llvm::Type::getInt32Ty(ctx), pipelineII.getInt())),
+                  llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                      llvm::Type::getInt1Ty(ctx), rewind.getInt())),
+                  llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                      llvm::Type::getInt8Ty(ctx), pipelineStyle.getInt()))}));
+      }
+
+      if (Attribute attr = opInst.getAttr("llvm.loop.latency")) {
+        auto loopAttr = attr.cast<ArrayAttr>();
+        auto min = loopAttr.getValue()[0].cast<IntegerAttr>();
+        auto max = loopAttr.getValue()[1].cast<IntegerAttr>();
+        loopOptions.push_back(llvm::MDNode::get(
+            ctx, {llvm::MDString::get(ctx, "llvm.loop.latency"),
+                  llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                      llvm::Type::getInt32Ty(ctx), min.getInt())),
+                  llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                      llvm::Type::getInt32Ty(ctx), max.getInt()))}));
+      }
+
+      if (Attribute attr = opInst.getAttr("llvm.loop.tripcount")) {
+        auto loopAttr = attr.cast<ArrayAttr>();
+        auto v0 = loopAttr.getValue()[0].cast<IntegerAttr>();
+        auto v1 = loopAttr.getValue()[1].cast<IntegerAttr>();
+        auto v2 = loopAttr.getValue()[2].cast<IntegerAttr>();
+        loopOptions.push_back(llvm::MDNode::get(
+            ctx, {llvm::MDString::get(ctx, "llvm.loop.tripcount"),
+                  llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                      llvm::Type::getInt32Ty(ctx), v0.getInt())),
+                  llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                      llvm::Type::getInt32Ty(ctx), v1.getInt())),
+                  llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                      llvm::Type::getInt32Ty(ctx), v2.getInt()))}));
       }
 
       // Create loop options and set the first operand to itself.
@@ -244,7 +356,8 @@ static void setLoopMetadata(Operation &opInst, llvm::Instruction &llvmInst,
 
       // Store a map from this Attribute to the LLVM metadata in case we
       // encounter it again.
-      moduleTranslation.mapLoopOptionsMetadata(attr, loopMD);
+      if (attr) moduleTranslation.mapLoopOptionsMetadata(attr, loopMD);
+      if (altAttr) moduleTranslation.mapLoopOptionsMetadata(altAttr, loopMD);
     }
 
     llvmInst.setMetadata(module->getMDKindID("llvm.loop"), loopMD);
