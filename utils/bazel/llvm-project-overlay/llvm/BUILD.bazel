@@ -915,7 +915,6 @@ cc_library(
         ":BinaryFormat",
         ":BitReader",
         ":Core",
-        ":IRPrinter",
         ":IRReader",
         ":MC",
         ":MCParser",
